@@ -3,6 +3,8 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { ReceiveMessageCommand, DeleteMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { DeleteObjectCommand, S3Client } from '@aws-sdk/client-s3';
+
 import { S3Event } from 'aws-lambda';
 import { spinContainer } from './azure';
 
@@ -13,6 +15,30 @@ const sqsClient = new SQSClient({
         secretAccessKey: process.env.AWS_ACCESS_SECRET || " "
     }
 });
+
+const s3Client = new S3Client({
+    region: process.env.REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY || " ",
+        secretAccessKey: process.env.AWS_ACCESS_SECRET || " "
+    }
+});
+
+
+async function deleteSourceVideo(bucketName: string, key: string) {
+    try {
+        const deleteCommand = new DeleteObjectCommand({
+            Bucket: bucketName,
+            Key: key
+        });
+        await s3Client.send(deleteCommand);
+        console.log(`Successfully deleted source video: ${key} from bucket: ${bucketName}`);
+    } catch (error) {
+        console.error(`Error deleting source video: ${key} from bucket: ${bucketName}`, error);
+        throw error;
+    }
+}
+
 
 async function init() {
     const command = new ReceiveMessageCommand({
@@ -41,18 +67,28 @@ async function init() {
                     const { s3 } = record;
                     const { bucket, object: { key } } = s3;
 
-                    await spinContainer(bucket.name, key);
+                    try {
+                        await spinContainer(bucket.name, key);
+
+                        await deleteSourceVideo(bucket.name, key);
+
+                        // Delete message from queue after processing
+                        if (ReceiptHandle) {
+                            const deleteCommand = new DeleteMessageCommand({
+                                QueueUrl: process.env.SQS_URL,
+                                ReceiptHandle
+                            });
+                            await sqsClient.send(deleteCommand);
+                            console.log(`Deleted message: ${MessageId}`);
+                        }
+                    } catch (error) {
+                        console.error("Error processing video:", error);
+                        // Don't delete the SQS message if processing failed
+                        // It will become visible again after the visibility timeout
+                        throw error;
+                    }
                 }
 
-                // Delete message from queue after processing
-                if (ReceiptHandle) {
-                    const deleteCommand = new DeleteMessageCommand({
-                        QueueUrl: process.env.SQS_URL,
-                        ReceiptHandle
-                    });
-                    await sqsClient.send(deleteCommand);
-                    console.log(`Deleted message: ${MessageId}`);
-                }
             } catch (error) {
                 console.error("[MESSAGE QUEUE ERROR]", error);
             }
